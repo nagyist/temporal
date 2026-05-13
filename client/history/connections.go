@@ -30,11 +30,8 @@ type (
 		historyServiceResolver membership.ServiceResolver
 		rpcFactory             RPCFactory
 		clientCtor             func(grpc.ClientConnInterface) C
-
-		logger             log.Logger
-		goros              goro.Group
-		membershipUpdateCh chan *membership.ChangedEvent
-		listenerName       string
+		logger                 log.Logger
+		goros                  goro.Group
 	}
 
 	// RPCFactory is a subset of the [go.temporal.io/server/common/rpc.RPCFactory] interface to make testing easier.
@@ -60,8 +57,6 @@ func NewConnectionPool[C any](
 		rpcFactory:             rpcFactory,
 		clientCtor:             clientCtor,
 		logger:                 logger,
-		membershipUpdateCh:     make(chan *membership.ChangedEvent, 1),
-		listenerName:           fmt.Sprintf("connectionPoolListener-%s", uuid.New().String()),
 	}
 	c.mu.conns = make(map[rpcAddress]clientConnection[C])
 	c.goros.Go(c.eventLoop)
@@ -109,13 +104,15 @@ func (c *connectionPoolImpl[C]) resetConnectBackoff(cc clientConnection[C]) {
 }
 
 func (c *connectionPoolImpl[C]) eventLoop(ctx context.Context) error {
-	if err := c.historyServiceResolver.AddListener(c.listenerName, c.membershipUpdateCh); err != nil {
-		c.logger.Error("Error adding membership listener for connectionPool", tag.Error(err))
+	listenerName := fmt.Sprintf("connectionPoolListener-%s", uuid.New().String())
+	updateCh := make(chan *membership.ChangedEvent, 1)
+	if err := c.historyServiceResolver.AddListener(listenerName, updateCh); err != nil {
+		c.logger.Error("Error adding membership listener", tag.Error(err))
 		return err
 	}
 	defer func() {
-		if err := c.historyServiceResolver.RemoveListener(c.listenerName); err != nil {
-			c.logger.Warn("Error removing membership listener for connectionPool", tag.Error(err))
+		if err := c.historyServiceResolver.RemoveListener(listenerName); err != nil {
+			c.logger.Warn("Error removing membership listener", tag.Error(err))
 		}
 	}()
 
@@ -123,16 +120,14 @@ func (c *connectionPoolImpl[C]) eventLoop(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-c.membershipUpdateCh:
+		case <-updateCh:
 			c.evictStale()
 		}
 	}
 }
 
-// evictStale closes and removes cached connections for hosts that are no
-// longer in the membership ring. In-flight requests on an evicted connection
-// will fail; callers retry via the redirector and pick up a fresh connection
-// for the new owner.
+// evictStale closes connections for hosts no longer in the ring. In-flight
+// RPCs fail fast with Unavailable; the redirector retries.
 func (c *connectionPoolImpl[C]) evictStale() {
 	members := c.historyServiceResolver.Members()
 	live := make(map[rpcAddress]struct{}, len(members))

@@ -24,20 +24,13 @@ type (
 		GetAllAddresses() ([]string, error)
 	}
 
-	// ClientProvider creates a cached client for the given clientKey. The
-	// returned closer (if non-nil) is invoked when the entry is evicted, so
-	// callers can hand back the underlying *grpc.ClientConn (or any other
-	// closable handle) to be released on eviction.
-	ClientProvider func(clientKey string) (any, io.Closer, error)
+	// The returned io.Closer (if non-nil) is invoked when the entry is evicted.
+	clientProvider func(clientKey string) (any, io.Closer, error)
 
-	// MembershipSubscription describes the hooks ClientCache needs to track
-	// membership changes without taking a direct dependency on the
-	// membership package (which would introduce an import cycle via
-	// common/testing/nettest).
-	//
-	// Subscribe registers notifyCh to receive a value whenever membership
-	// changes and returns an unsubscribe func. CurrentAddresses returns the
-	// addresses currently in the membership ring.
+	// MembershipSubscription decouples ClientCache from membership package to
+	// avoid an import cycle via common/testing/nettest. Subscribe registers a
+	// notify channel and returns an unsubscribe func; CurrentAddresses returns
+	// addresses currently in the ring.
 	MembershipSubscription struct {
 		Subscribe        func(notifyCh chan<- struct{}) (unsubscribe func(), err error)
 		CurrentAddresses func() []string
@@ -50,37 +43,34 @@ type (
 
 	clientCacheImpl struct {
 		keyResolver    keyResolver
-		clientProvider ClientProvider
+		clientProvider clientProvider
 
 		cacheLock sync.RWMutex
 		clients   map[string]cachedEntry
 
-		// Optional fields populated when a MembershipSubscription is supplied.
 		membership MembershipSubscription
 		logger     log.Logger
 		goros      goro.Group
-		notifyCh   chan struct{}
 	}
 )
 
 // NewClientCache creates a new client cache. If membership.Subscribe is
-// non-nil, the cache subscribes to membership changes and evicts entries
-// (closing their associated resource) for addresses that leave the ring.
+// non-nil, the cache evicts entries (closing their resource) when their
+// address leaves the ring.
 func NewClientCache(
 	keyResolver keyResolver,
-	clientProvider ClientProvider,
+	provider clientProvider,
 	membership MembershipSubscription,
 	logger log.Logger,
 ) ClientCache {
 	c := &clientCacheImpl{
 		keyResolver:    keyResolver,
-		clientProvider: clientProvider,
+		clientProvider: provider,
 		clients:        make(map[string]cachedEntry),
 		membership:     membership,
 		logger:         logger,
 	}
 	if membership.Subscribe != nil {
-		c.notifyCh = make(chan struct{}, 1)
 		c.goros.Go(c.eventLoop)
 	}
 	return c
@@ -139,8 +129,6 @@ func (c *clientCacheImpl) GetAllClients() ([]any, error) {
 	return result, nil
 }
 
-// evict removes the cached entry for clientKey and closes its associated
-// resource if a closer was provided by the clientProvider.
 func (c *clientCacheImpl) evict(clientKey string) {
 	c.cacheLock.Lock()
 	entry, ok := c.clients[clientKey]
@@ -157,10 +145,11 @@ func (c *clientCacheImpl) evict(clientKey string) {
 }
 
 func (c *clientCacheImpl) eventLoop(ctx context.Context) error {
-	unsubscribe, err := c.membership.Subscribe(c.notifyCh)
+	notifyCh := make(chan struct{}, 1)
+	unsubscribe, err := c.membership.Subscribe(notifyCh)
 	if err != nil {
 		if c.logger != nil {
-			c.logger.Error("Error subscribing to membership for clientCache", tag.Error(err))
+			c.logger.Error("Error subscribing to membership", tag.Error(err))
 		}
 		return err
 	}
@@ -170,7 +159,7 @@ func (c *clientCacheImpl) eventLoop(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-c.notifyCh:
+		case <-notifyCh:
 			c.evictStale()
 		}
 	}
