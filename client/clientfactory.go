@@ -3,6 +3,8 @@
 package client
 
 import (
+	"fmt"
+	"io"
 	"time"
 
 	"go.temporal.io/api/workflowservice/v1"
@@ -129,14 +131,49 @@ func (cf *rpcClientFactory) NewMatchingClientWithTimeout(
 	}
 
 	keyResolver := newServiceKeyResolver(resolver)
-	clientProvider := func(clientKey string) (any, error) {
+	clientProvider := func(clientKey string) (any, io.Closer, error) {
 		connection := cf.rpcFactory.CreateMatchingGRPCConnection(clientKey)
-		return matchingservice.NewMatchingServiceClient(connection), nil
+		return matchingservice.NewMatchingServiceClient(connection), connection, nil
+	}
+	membershipSub := common.MembershipSubscription{
+		Subscribe: func(notifyCh chan<- struct{}) (func(), error) {
+			listenerName := fmt.Sprintf("matchingClientCache-%p", notifyCh)
+			internalCh := make(chan *membership.ChangedEvent, 1)
+			if err := resolver.AddListener(listenerName, internalCh); err != nil {
+				return nil, err
+			}
+			done := make(chan struct{})
+			go func() {
+				for {
+					select {
+					case <-done:
+						return
+					case <-internalCh:
+						select {
+						case notifyCh <- struct{}{}:
+						default:
+						}
+					}
+				}
+			}()
+			return func() {
+				close(done)
+				_ = resolver.RemoveListener(listenerName)
+			}, nil
+		},
+		CurrentAddresses: func() []string {
+			members := resolver.Members()
+			addrs := make([]string, 0, len(members))
+			for _, m := range members {
+				addrs = append(addrs, m.GetAddress())
+			}
+			return addrs
+		},
 	}
 	client := matching.NewClient(
 		timeout,
 		longPollTimeout,
-		common.NewClientCache(keyResolver, clientProvider),
+		common.NewClientCache(keyResolver, clientProvider, membershipSub, cf.logger),
 		cf.metricsHandler,
 		cf.logger,
 		matching.NewLoadBalancer(namespaceIDToName, cf.dynConfig, cf.testHooks),
