@@ -17,9 +17,6 @@ type (
 		GetClientForKey(key string, index int) (any, error)
 		GetClientForClientKey(clientKey string) (any, error)
 		GetAllClients() ([]any, error)
-		// Evict removes the cached entry for clientKey and closes its
-		// associated resource if a closer was provided by the clientProvider.
-		Evict(clientKey string)
 	}
 
 	keyResolver interface {
@@ -142,7 +139,9 @@ func (c *clientCacheImpl) GetAllClients() ([]any, error) {
 	return result, nil
 }
 
-func (c *clientCacheImpl) Evict(clientKey string) {
+// evict removes the cached entry for clientKey and closes its associated
+// resource if a closer was provided by the clientProvider.
+func (c *clientCacheImpl) evict(clientKey string) {
 	c.cacheLock.Lock()
 	entry, ok := c.clients[clientKey]
 	if ok {
@@ -194,6 +193,6 @@ func (c *clientCacheImpl) evictStale() {
 	c.cacheLock.Unlock()
 
 	for _, addr := range stale {
-		c.Evict(addr)
+		c.evict(addr)
 	}
 }

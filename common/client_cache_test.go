@@ -87,7 +87,7 @@ func TestClientCache_EvictRemovesEntryAndClosesResource(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "client-for-addr:1234", c)
 
-	cache.Evict("addr:1234")
+	cache.(*clientCacheImpl).evict("addr:1234")
 	require.True(t, closer.Closed(), "evicted entry's closer should run")
 
 	// After eviction, calling again creates a fresh entry via the provider.
@@ -98,7 +98,7 @@ func TestClientCache_EvictRemovesEntryAndClosesResource(t *testing.T) {
 	cache2 := NewClientCache(&fakeKeyResolver{}, provider2, MembershipSubscription{}, log.NewNoopLogger())
 	_, err = cache2.GetClientForClientKey("addr:1234")
 	require.NoError(t, err)
-	cache2.Evict("addr:1234")
+	cache2.(*clientCacheImpl).evict("addr:1234")
 	require.True(t, newCloser.Closed())
 }
 
@@ -110,5 +110,5 @@ func TestClientCache_NilResolverSkipsListener(t *testing.T) {
 	c, err := cache.GetClientForClientKey("addr")
 	require.NoError(t, err)
 	require.Equal(t, "addr", c)
-	cache.Evict("addr") // nil closer is safe
+	cache.(*clientCacheImpl).evict("addr") // nil closer is safe
 }
