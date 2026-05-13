@@ -1,10 +1,8 @@
 package common
 
 import (
-	"context"
 	"sync"
 
-	"go.temporal.io/server/common/goro"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 )
@@ -49,7 +47,6 @@ type (
 
 		membership MembershipSubscription
 		logger     log.Logger
-		goros      goro.Group
 	}
 )
 
@@ -70,7 +67,7 @@ func NewClientCache(
 		logger:         logger,
 	}
 	if membership.Subscribe != nil {
-		c.goros.Go(c.eventLoop)
+		go c.eventLoop()
 	}
 	return c
 }
@@ -143,24 +140,19 @@ func (c *clientCacheImpl) evict(clientKey string) {
 	}
 }
 
-func (c *clientCacheImpl) eventLoop(ctx context.Context) error {
+func (c *clientCacheImpl) eventLoop() {
 	notifyCh := make(chan struct{}, 1)
 	unsubscribe, err := c.membership.Subscribe(notifyCh)
 	if err != nil {
 		if c.logger != nil {
 			c.logger.Error("Error subscribing to membership", tag.Error(err))
 		}
-		return err
+		return
 	}
 	defer unsubscribe()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-notifyCh:
-			c.evictStale()
-		}
+	for range notifyCh {
+		c.evictStale()
 	}
 }
 

@@ -6,7 +6,6 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
-	"go.temporal.io/server/common/goro"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/membership"
@@ -31,7 +30,7 @@ type (
 		rpcFactory             RPCFactory
 		clientCtor             func(grpc.ClientConnInterface) C
 		logger                 log.Logger
-		goros                  goro.Group
+		cancelEventLoop        context.CancelFunc
 	}
 
 	// RPCFactory is a subset of the [go.temporal.io/server/common/rpc.RPCFactory] interface to make testing easier.
@@ -59,7 +58,9 @@ func NewConnectionPool[C any](
 		logger:                 logger,
 	}
 	c.mu.conns = make(map[rpcAddress]clientConnection[C])
-	c.goros.Go(c.eventLoop)
+	ctx, cancel := context.WithCancel(context.Background())
+	c.cancelEventLoop = cancel
+	go c.eventLoop(ctx)
 	return c
 }
 
@@ -103,12 +104,12 @@ func (c *connectionPoolImpl[C]) resetConnectBackoff(cc clientConnection[C]) {
 	cc.grpcConn.ResetConnectBackoff()
 }
 
-func (c *connectionPoolImpl[C]) eventLoop(ctx context.Context) error {
+func (c *connectionPoolImpl[C]) eventLoop(ctx context.Context) {
 	listenerName := fmt.Sprintf("connectionPoolListener-%s", uuid.New().String())
 	updateCh := make(chan *membership.ChangedEvent, 1)
 	if err := c.historyServiceResolver.AddListener(listenerName, updateCh); err != nil {
 		c.logger.Error("Error adding membership listener", tag.Error(err))
-		return err
+		return
 	}
 	defer func() {
 		if err := c.historyServiceResolver.RemoveListener(listenerName); err != nil {
@@ -119,7 +120,7 @@ func (c *connectionPoolImpl[C]) eventLoop(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		case <-updateCh:
 			c.evictStale()
 		}
@@ -153,6 +154,5 @@ func (c *connectionPoolImpl[C]) evictStale() {
 }
 
 func (c *connectionPoolImpl[C]) stop() {
-	c.goros.Cancel()
-	c.goros.Wait()
+	c.cancelEventLoop()
 }
