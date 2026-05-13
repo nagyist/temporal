@@ -7,6 +7,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/google/uuid"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/server/api/adminservice/v1"
 	"go.temporal.io/server/api/historyservice/v1"
@@ -137,7 +138,7 @@ func (cf *rpcClientFactory) NewMatchingClientWithTimeout(
 	}
 	membershipSub := common.MembershipSubscription{
 		Subscribe: func(notifyCh chan<- struct{}) (func(), error) {
-			listenerName := fmt.Sprintf("matchingClientCache-%p", notifyCh)
+			listenerName := fmt.Sprintf("matchingClientCache-%s", uuid.New().String())
 			internalCh := make(chan *membership.ChangedEvent, 1)
 			if err := resolver.AddListener(listenerName, internalCh); err != nil {
 				return nil, err

@@ -108,13 +108,17 @@ func TestConnectionPool_EvictionIsIdempotent(t *testing.T) {
 	notifyCh := <-listenerCh
 	notifyCh <- &membership.ChangedEvent{}
 
-	// Give the event loop time to process; addr1 should still be cached.
-	time.Sleep(100 * time.Millisecond)
+	// addr1 is still a member; the event loop must not evict it.
+	require.Never(t, func() bool {
+		pool.mu.RLock()
+		defer pool.mu.RUnlock()
+		_, stillCached := pool.mu.conns["addr1:7235"]
+		return !stillCached
+	}, 200*time.Millisecond, 10*time.Millisecond, "expected addr1 to remain cached")
 
 	pool.mu.RLock()
-	cached, ok := pool.mu.conns["addr1:7235"]
+	cached := pool.mu.conns["addr1:7235"]
 	pool.mu.RUnlock()
-	require.True(t, ok)
 	require.Equal(t, cc1.grpcConn, cached.grpcConn)
 	require.NotEqual(t, connectivity.Shutdown, cc1.grpcConn.GetState())
 }
