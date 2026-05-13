@@ -2,7 +2,6 @@ package common
 
 import (
 	"errors"
-	"io"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,32 +12,29 @@ import (
 
 type fakeKeyResolver struct{}
 
-func (f *fakeKeyResolver) Lookup(_ string, _ int) (string, error)  { return "", errors.New("unused") }
-func (f *fakeKeyResolver) GetAllAddresses() ([]string, error)      { return nil, nil }
+func (f *fakeKeyResolver) Lookup(_ string, _ int) (string, error) { return "", errors.New("unused") }
+func (f *fakeKeyResolver) GetAllAddresses() ([]string, error)     { return nil, nil }
 
-type countingCloser struct {
-	closed int32
-}
-
-func (c *countingCloser) Close() error {
-	atomic.AddInt32(&c.closed, 1)
-	return nil
-}
-
-func (c *countingCloser) Closed() bool {
-	return atomic.LoadInt32(&c.closed) > 0
+func makeReleaseTracker() (func() error, func() bool) {
+	var released int32
+	return func() error {
+			atomic.AddInt32(&released, 1)
+			return nil
+		}, func() bool {
+			return atomic.LoadInt32(&released) > 0
+		}
 }
 
 func TestClientCache_EvictsStaleEntriesOnMembershipChange(t *testing.T) {
-	closer1 := &countingCloser{}
-	closer2 := &countingCloser{}
-	closersByKey := map[string]*countingCloser{
-		"addr1:7235": closer1,
-		"addr2:7235": closer2,
+	release1, released1 := makeReleaseTracker()
+	release2, released2 := makeReleaseTracker()
+	releasesByKey := map[string]func() error{
+		"addr1:7235": release1,
+		"addr2:7235": release2,
 	}
 
-	provider := func(clientKey string) (any, io.Closer, error) {
-		return struct{}{}, closersByKey[clientKey], nil
+	provider := func(clientKey string) (any, func() error, error) {
+		return struct{}{}, releasesByKey[clientKey], nil
 	}
 
 	subscribed := make(chan chan<- struct{}, 1)
@@ -68,17 +64,15 @@ func TestClientCache_EvictsStaleEntriesOnMembershipChange(t *testing.T) {
 	notifyCh := <-subscribed
 	notifyCh <- struct{}{}
 
-	require.Eventually(t, func() bool {
-		return closer1.Closed()
-	}, 2*time.Second, 10*time.Millisecond, "expected addr1 entry to be evicted and closed")
-
-	require.False(t, closer2.Closed(), "expected addr2 to remain cached")
+	require.Eventually(t, released1, 2*time.Second, 10*time.Millisecond,
+		"expected addr1 entry to be evicted and released")
+	require.False(t, released2(), "expected addr2 to remain cached")
 }
 
-func TestClientCache_EvictRemovesEntryAndClosesResource(t *testing.T) {
-	closer := &countingCloser{}
-	provider := func(clientKey string) (any, io.Closer, error) {
-		return "client-for-" + clientKey, closer, nil
+func TestClientCache_EvictReleasesResource(t *testing.T) {
+	release, released := makeReleaseTracker()
+	provider := func(clientKey string) (any, func() error, error) {
+		return "client-for-" + clientKey, release, nil
 	}
 
 	cache := NewClientCache(&fakeKeyResolver{}, provider, MembershipSubscription{}, log.NewNoopLogger())
@@ -88,27 +82,16 @@ func TestClientCache_EvictRemovesEntryAndClosesResource(t *testing.T) {
 	require.Equal(t, "client-for-addr:1234", c)
 
 	cache.(*clientCacheImpl).evict("addr:1234")
-	require.True(t, closer.Closed(), "evicted entry's closer should run")
-
-	// After eviction, calling again creates a fresh entry via the provider.
-	newCloser := &countingCloser{}
-	provider2 := func(clientKey string) (any, io.Closer, error) {
-		return "fresh-" + clientKey, newCloser, nil
-	}
-	cache2 := NewClientCache(&fakeKeyResolver{}, provider2, MembershipSubscription{}, log.NewNoopLogger())
-	_, err = cache2.GetClientForClientKey("addr:1234")
-	require.NoError(t, err)
-	cache2.(*clientCacheImpl).evict("addr:1234")
-	require.True(t, newCloser.Closed())
+	require.True(t, released())
 }
 
-func TestClientCache_NilResolverSkipsListener(t *testing.T) {
-	provider := func(clientKey string) (any, io.Closer, error) {
+func TestClientCache_NilReleaseFnIsSafe(t *testing.T) {
+	provider := func(clientKey string) (any, func() error, error) {
 		return clientKey, nil, nil
 	}
 	cache := NewClientCache(&fakeKeyResolver{}, provider, MembershipSubscription{}, log.NewNoopLogger())
 	c, err := cache.GetClientForClientKey("addr")
 	require.NoError(t, err)
 	require.Equal(t, "addr", c)
-	cache.(*clientCacheImpl).evict("addr") // nil closer is safe
+	cache.(*clientCacheImpl).evict("addr")
 }

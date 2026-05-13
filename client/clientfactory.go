@@ -4,7 +4,6 @@ package client
 
 import (
 	"fmt"
-	"io"
 	"time"
 
 	"github.com/google/uuid"
@@ -132,9 +131,9 @@ func (cf *rpcClientFactory) NewMatchingClientWithTimeout(
 	}
 
 	keyResolver := newServiceKeyResolver(resolver)
-	clientProvider := func(clientKey string) (any, io.Closer, error) {
+	clientProvider := func(clientKey string) (any, func() error, error) {
 		connection := cf.rpcFactory.CreateMatchingGRPCConnection(clientKey)
-		return matchingservice.NewMatchingServiceClient(connection), connection, nil
+		return matchingservice.NewMatchingServiceClient(connection), connection.Close, nil
 	}
 	membershipSub := common.MembershipSubscription{
 		Subscribe: func(notifyCh chan<- struct{}) (func(), error) {

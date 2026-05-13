@@ -2,7 +2,6 @@ package common
 
 import (
 	"context"
-	"io"
 	"sync"
 
 	"go.temporal.io/server/common/goro"
@@ -24,8 +23,8 @@ type (
 		GetAllAddresses() ([]string, error)
 	}
 
-	// The returned io.Closer (if non-nil) is invoked when the entry is evicted.
-	clientProvider func(clientKey string) (any, io.Closer, error)
+	// The returned release fn (if non-nil) is invoked when the entry is evicted.
+	clientProvider func(clientKey string) (any, func() error, error)
 
 	// MembershipSubscription decouples ClientCache from membership package to
 	// avoid an import cycle via common/testing/nettest. Subscribe registers a
@@ -37,8 +36,8 @@ type (
 	}
 
 	cachedEntry struct {
-		client any
-		closer io.Closer
+		client  any
+		release func() error
 	}
 
 	clientCacheImpl struct {
@@ -104,11 +103,11 @@ func (c *clientCacheImpl) GetClientForClientKey(clientKey string) (any, error) {
 		return entry.client, nil
 	}
 
-	client, closer, err := c.clientProvider(clientKey)
+	client, release, err := c.clientProvider(clientKey)
 	if err != nil {
 		return nil, err
 	}
-	c.clients[clientKey] = cachedEntry{client: client, closer: closer}
+	c.clients[clientKey] = cachedEntry{client: client, release: release}
 	return client, nil
 }
 
@@ -137,9 +136,9 @@ func (c *clientCacheImpl) evict(clientKey string) {
 	}
 	c.cacheLock.Unlock()
 
-	if ok && entry.closer != nil {
-		if err := entry.closer.Close(); err != nil && c.logger != nil {
-			c.logger.Warn("Error closing evicted client resource", tag.Error(err))
+	if ok && entry.release != nil {
+		if err := entry.release(); err != nil && c.logger != nil {
+			c.logger.Warn("Error releasing evicted client resource", tag.Error(err))
 		}
 	}
 }
