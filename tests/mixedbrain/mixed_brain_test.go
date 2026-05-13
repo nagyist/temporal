@@ -98,17 +98,27 @@ func TestMixedBrain(t *testing.T) {
 		currentBase, releaseBase = 7230, 7240
 	}
 
+	// Standalone Nexus is a current-only feature (off by default in releases
+	// pre-1.31). Enabling it on the current server lets omes exercise the
+	// StartNexusOperationExecution RPC; requests that the proxy routes to
+	// the release server come back with Unimplemented, which the omes
+	// scenario tolerates as a no-op.
+	currentDC := map[string]any{
+		"nexusoperation.enableStandalone": true,
+	}
+
 	// Start the current-source server first so the release server can target
 	// its frontend in cluster metadata.
 	currentLogger, currentLog := serverLogger(t, "current", logRoot)
 	defer currentLog.Close()
 	currentSrv, err := devserver.Start(t.Context(), devserver.Options{
-		SourceDir:   sourceRoot(),
-		PortBase:    currentBase,
-		Persistence: persistence,
-		Stdout:      currentLog,
-		Stderr:      currentLog,
-		Logger:      currentLogger,
+		SourceDir:           sourceRoot(),
+		PortBase:            currentBase,
+		Persistence:         persistence,
+		DynamicConfigValues: currentDC,
+		Stdout:              currentLog,
+		Stderr:              currentLog,
+		Logger:              currentLogger,
 	})
 	require.NoError(t, err, "start current server")
 	t.Cleanup(func() { _ = currentSrv.Stop() })
@@ -191,6 +201,10 @@ func runOmes(t *testing.T, binary, serverAddr, logPath string, duration time.Dur
 			"--max-concurrent", "5",
 			"--option", "internal-iterations=10",
 			"--option", "nexus-endpoint="+nexusEndpoint,
+			// Exercise StartNexusOperationExecution: enabled on the
+			// current server, Unimplemented on the release server (the
+			// omes scenario tolerates the latter).
+			"--option", "include-standalone-nexus=true",
 		)
 		cmd.Stdout = logFile
 		cmd.Stderr = io.MultiWriter(logFile, &buf)
