@@ -46,8 +46,8 @@ type (
 	}
 
 	// nexusEndpointClient manages cache and persistence access for Nexus endpoints.
-	// It serializes updates via lookupCache's RWMutex to prevent nexus_endpoints table
-	// version conflicts.
+	// nexusEndpointClient contains a RWLock to enforce serial updates to prevent
+	// nexus_endpoints table version conflicts.
 	//
 	// nexusEndpointClient should only be used within matching service because it assumes
 	// that it is running on the matching node that owns the nexus_endpoints table.
@@ -56,7 +56,8 @@ type (
 	nexusEndpointClient struct {
 		hasLoadedEndpoints atomic.Bool
 
-		// endpointEntries and tableVersionChanged are protected by lookupCache's RWMutex.
+		sync.RWMutex        // protects tableVersion, endpointEntries, and tableVersionChanged
+		tableVersion        int64
 		endpointEntries     []*persistencespb.NexusEndpointEntry // sorted by ID to support pagination during ListNexusEndpoints
 		tableVersionChanged chan struct{}
 
@@ -94,10 +95,10 @@ func (m *nexusEndpointClient) CreateNexusEndpoint(
 		}
 	}
 
-	m.lookupCache.Lock()
-	defer m.lookupCache.Unlock()
+	m.Lock()
+	defer m.Unlock()
 
-	if _, _, exists := m.lookupCache.GetByNameLocked(request.spec.GetName()); exists {
+	if _, _, exists := m.lookupCache.GetByName(request.spec.GetName()); exists {
 		return nil, serviceerror.NewAlreadyExistsf("error creating Nexus endpoint. Endpoint with name %v already registered", request.spec.GetName())
 	}
 
@@ -112,7 +113,7 @@ func (m *nexusEndpointClient) CreateNexusEndpoint(
 	}
 
 	resp, err := m.persistence.CreateOrUpdateNexusEndpoint(ctx, &p.CreateOrUpdateNexusEndpointRequest{
-		LastKnownTableVersion: m.lookupCache.VersionLocked(),
+		LastKnownTableVersion: m.tableVersion,
 		Entry:                 entry,
 	})
 	if err != nil {
@@ -120,7 +121,8 @@ func (m *nexusEndpointClient) CreateNexusEndpoint(
 	}
 
 	entry.Version = resp.Version
-	m.lookupCache.ApplyChangeLocked(nil, entry)
+	m.tableVersion++
+	m.lookupCache.ApplyChange(m.tableVersion, nil, entry)
 	m.insertEndpointLocked(entry)
 	ch := m.tableVersionChanged
 	m.tableVersionChanged = make(chan struct{})
@@ -143,10 +145,10 @@ func (m *nexusEndpointClient) UpdateNexusEndpoint(
 		}
 	}
 
-	m.lookupCache.Lock()
-	defer m.lookupCache.Unlock()
+	m.Lock()
+	defer m.Unlock()
 
-	previous, _, exists := m.lookupCache.GetByIDLocked(request.endpointID)
+	previous, _, exists := m.lookupCache.GetByID(request.endpointID)
 	if !exists {
 		return nil, serviceerror.NewNotFoundf("error updating Nexus endpoint. endpoint ID %v not found", request.endpointID)
 	}
@@ -165,7 +167,7 @@ func (m *nexusEndpointClient) UpdateNexusEndpoint(
 	}
 
 	resp, err := m.persistence.CreateOrUpdateNexusEndpoint(ctx, &p.CreateOrUpdateNexusEndpointRequest{
-		LastKnownTableVersion: m.lookupCache.VersionLocked(),
+		LastKnownTableVersion: m.tableVersion,
 		Entry:                 entry,
 	})
 	if err != nil {
@@ -173,7 +175,8 @@ func (m *nexusEndpointClient) UpdateNexusEndpoint(
 	}
 
 	entry.Version = resp.Version
-	m.lookupCache.ApplyChangeLocked(previous, entry)
+	m.tableVersion++
+	m.lookupCache.ApplyChange(m.tableVersion, previous, entry)
 	m.insertEndpointLocked(entry)
 	ch := m.tableVersionChanged
 	m.tableVersionChanged = make(chan struct{})
@@ -207,23 +210,24 @@ func (m *nexusEndpointClient) DeleteNexusEndpoint(
 		}
 	}
 
-	m.lookupCache.Lock()
-	defer m.lookupCache.Unlock()
+	m.Lock()
+	defer m.Unlock()
 
-	entry, _, ok := m.lookupCache.GetByIDLocked(request.Id)
+	entry, _, ok := m.lookupCache.GetByID(request.Id)
 	if !ok {
 		return nil, serviceerror.NewNotFoundf("error deleting nexus endpoint with ID: %v", request.Id)
 	}
 
 	err := m.persistence.DeleteNexusEndpoint(ctx, &p.DeleteNexusEndpointRequest{
-		LastKnownTableVersion: m.lookupCache.VersionLocked(),
+		LastKnownTableVersion: m.tableVersion,
 		ID:                    entry.Id,
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	m.lookupCache.ApplyChangeLocked(entry, nil)
+	m.tableVersion++
+	m.lookupCache.ApplyChange(m.tableVersion, entry, nil)
 	m.endpointEntries = slices.DeleteFunc(m.endpointEntries, func(entry *persistencespb.NexusEndpointEntry) bool {
 		return entry.Id == request.Id
 	})
@@ -238,12 +242,12 @@ func (m *nexusEndpointClient) ListNexusEndpoints(
 	ctx context.Context,
 	request *matchingservice.ListNexusEndpointsRequest,
 ) (*matchingservice.ListNexusEndpointsResponse, chan struct{}, error) {
-	m.lookupCache.RLock()
-	if request.LastKnownTableVersion > m.lookupCache.VersionLocked() {
+	m.RLock()
+	if request.LastKnownTableVersion > m.tableVersion {
 		// indicates we may have lost table ownership, so need to reload from persistence
 		m.hasLoadedEndpoints.Store(false)
 	}
-	m.lookupCache.RUnlock()
+	m.RUnlock()
 
 	if !m.hasLoadedEndpoints.Load() {
 		if err := m.loadEndpoints(ctx); err != nil {
@@ -251,12 +255,11 @@ func (m *nexusEndpointClient) ListNexusEndpoints(
 		}
 	}
 
-	m.lookupCache.RLock()
-	defer m.lookupCache.RUnlock()
+	m.RLock()
+	defer m.RUnlock()
 
-	tableVersion := m.lookupCache.VersionLocked()
-	if request.LastKnownTableVersion != 0 && request.LastKnownTableVersion != tableVersion {
-		return nil, nil, serviceerror.NewFailedPreconditionf("nexus endpoints table version mismatch. received: %v expected %v", request.LastKnownTableVersion, tableVersion)
+	if request.LastKnownTableVersion != 0 && request.LastKnownTableVersion != m.tableVersion {
+		return nil, nil, serviceerror.NewFailedPreconditionf("nexus endpoints table version mismatch. received: %v expected %v", request.LastKnownTableVersion, m.tableVersion)
 	}
 
 	startIdx := 0
@@ -284,7 +287,7 @@ func (m *nexusEndpointClient) ListNexusEndpoints(
 	}
 
 	resp := &matchingservice.ListNexusEndpointsResponse{
-		TableVersion:  tableVersion,
+		TableVersion:  m.tableVersion,
 		NextPageToken: nextPageToken,
 		Entries:       slices.Clone(m.endpointEntries[startIdx:endIdx]),
 	}
@@ -293,8 +296,8 @@ func (m *nexusEndpointClient) ListNexusEndpoints(
 }
 
 func (m *nexusEndpointClient) loadEndpoints(ctx context.Context) error {
-	m.lookupCache.Lock()
-	defer m.lookupCache.Unlock()
+	m.Lock()
+	defer m.Unlock()
 
 	if m.hasLoadedEndpoints.Load() {
 		// check whether endpoints were loaded while waiting for write lock
@@ -305,11 +308,10 @@ func (m *nexusEndpointClient) loadEndpoints(ctx context.Context) error {
 	m.resetCacheStateLocked()
 
 	var pageToken []byte
-	var tableVersion int64
 
 	for ctx.Err() == nil {
 		resp, err := m.persistence.ListNexusEndpoints(ctx, &p.ListNexusEndpointsRequest{
-			LastKnownTableVersion: tableVersion,
+			LastKnownTableVersion: m.tableVersion,
 			NextPageToken:         pageToken,
 			PageSize:              loadEndpointsPageSize,
 		})
@@ -318,15 +320,16 @@ func (m *nexusEndpointClient) loadEndpoints(ctx context.Context) error {
 				// indicates table was updated during paging, so reset and start from the beginning
 				m.resetCacheStateLocked()
 				pageToken = nil
-				tableVersion = 0
 				continue
 			}
 			return err
 		}
 
 		pageToken = resp.NextPageToken
-		tableVersion = resp.TableVersion
-		m.endpointEntries = append(m.endpointEntries, resp.Entries...)
+		m.tableVersion = resp.TableVersion
+		for _, entry := range resp.Entries {
+			m.endpointEntries = append(m.endpointEntries, entry)
+		}
 
 		if len(pageToken) == 0 {
 			break
@@ -335,14 +338,15 @@ func (m *nexusEndpointClient) loadEndpoints(ctx context.Context) error {
 
 	m.hasLoadedEndpoints.Store(ctx.Err() == nil)
 	if ctx.Err() == nil {
-		m.lookupCache.ReplaceAllLocked(tableVersion, m.endpointEntries)
+		m.lookupCache.ReplaceAll(m.tableVersion, m.endpointEntries)
 	}
 	return ctx.Err()
 }
 
 func (m *nexusEndpointClient) resetCacheStateLocked() {
+	m.tableVersion = 0
 	m.endpointEntries = []*persistencespb.NexusEndpointEntry{}
-	m.lookupCache.ClearLocked()
+	m.lookupCache.Clear()
 }
 
 // notifyOwnershipChanged starts or stops a background routine which watches the Nexus endpoints table version for
@@ -382,14 +386,14 @@ func (m *nexusEndpointClient) refreshTableVersion(ctx context.Context) error {
 
 func (m *nexusEndpointClient) checkTableVersion(ctx context.Context) {
 	// Acquire lock to make sure we are not in the middle of an update.
-	m.lookupCache.Lock()
-	defer m.lookupCache.Unlock()
+	m.Lock()
+	defer m.Unlock()
 
 	resp, err := m.persistence.ListNexusEndpoints(ctx, &p.ListNexusEndpointsRequest{
 		LastKnownTableVersion: 0,
 		PageSize:              0,
 	})
-	if err != nil || resp.TableVersion != m.lookupCache.VersionLocked() {
+	if err != nil || resp.TableVersion != m.tableVersion {
 		m.hasLoadedEndpoints.Store(false)
 		ch := m.tableVersionChanged
 		m.tableVersionChanged = make(chan struct{})
